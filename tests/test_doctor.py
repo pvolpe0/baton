@@ -82,3 +82,76 @@ def test_fence_inactive_when_writable_by_run_user(tmp_path):
     paths = _fence_dir(tmp_path, worker_user="baton")
     os.chmod(paths["guard"], 0o666)   # worker could edit the guard -> not a fence
     assert D.fence_active("baton", paths) is False
+
+
+# --- engine immutability (the code that runs UNCONFINED must be root-owned + worker-read-only) ---
+def test_engine_verdict_truth_table():
+    assert D._engine_verdict(present=True,  root_owned=True,  writable=False, path="/opt/baton/x")[0] is True
+    assert D._engine_verdict(present=False, root_owned=False, writable=False, path="/opt/baton/x") == (False, "missing")
+    assert D._engine_verdict(present=True,  root_owned=True,  writable=True,  path="/opt/baton/x")[0] is False
+    assert "writable" in D._engine_verdict(present=True, root_owned=True, writable=True, path="/x")[1]
+    assert D._engine_verdict(present=True,  root_owned=False, writable=False, path="/opt/baton/x")[0] is False
+    assert "root" in D._engine_verdict(present=True, root_owned=False, writable=False, path="/x")[1]
+
+
+def test_verify_engine_immutable_flags_writable(tmp_path):
+    import os
+    f = tmp_path / "tick.py"
+    f.write_text("# code")
+    os.chmod(f, 0o666)                                  # worker-writable == escape
+    checks = D.verify_engine_immutable([str(f)])
+    assert checks[0][1] is False                        # not ok
+    assert "writable" in checks[0][2]
+    # a test-owned file is never root-owned, so a present+read-only file fails on ownership
+    os.chmod(f, 0o444)
+    checks = D.verify_engine_immutable([str(f)])
+    assert checks[0][1] is False and "root" in checks[0][2]
+
+
+def test_verify_engine_immutable_missing(tmp_path):
+    checks = D.verify_engine_immutable([str(tmp_path / "nope.py")])
+    assert checks[0][1] is False and checks[0][2] == "missing"
+
+
+def test_engine_immutable_false_when_missing(tmp_path):
+    assert D.engine_immutable([str(tmp_path / "nope.py")]) is False
+
+
+def test_engine_code_paths_uses_base_and_covers_all_unconfined_modules():
+    paths = D.engine_code_paths("/opt/baton")
+    for rel in ("runner/tick.py", "runner/notify.py", "lib/doctor.py", "lib/sandbox.py",
+                "lib/manifest.py", "lib/nodes.py", "guard/guard.py", "bin/baton"):
+        assert f"/opt/baton/{rel}" in paths
+    assert "/home/baton/baton/runner/tick.py" in D.engine_code_paths("/home/baton/baton")
+
+
+def test_verify_engine_immutable_also_checks_parent_dir(tmp_path):
+    import os
+    d = tmp_path / "runner"
+    d.mkdir()
+    f = d / "tick.py"
+    f.write_text("# code")
+    os.chmod(f, 0o444)                                   # file itself read-only...
+    names = [n for n, ok, det in D.verify_engine_immutable([str(f)])]
+    assert any(n.startswith("engine-dir:") for n in names)   # ...the containing dir is verified too
+
+
+# --- writable-set probe output parser ---
+def test_parse_writable_probe_confined():
+    ok, detail = D.parse_writable_probe("JOBDIR_OK\n")
+    assert ok is True
+
+
+def test_parse_writable_probe_too_broad():
+    ok, detail = D.parse_writable_probe("JOBDIR_OK\nSTATE_OPEN\nOPT_OPEN\n")
+    assert ok is False and "STATE_OPEN" in detail and "OPT_OPEN" in detail
+
+
+def test_parse_writable_probe_flags_config_systemd():
+    ok, detail = D.parse_writable_probe("JOBDIR_OK\nCONFIG_SYSTEMD_OPEN\n")
+    assert ok is False and "CONFIG_SYSTEMD_OPEN" in detail
+
+
+def test_parse_writable_probe_too_narrow():
+    ok, detail = D.parse_writable_probe("")            # job couldn't even write its own dir
+    assert ok is False and "result.json" in detail

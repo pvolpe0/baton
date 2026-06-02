@@ -105,6 +105,17 @@ def test_pick_next_none_when_empty(tmp_path):
     assert tick.pick_next(str(tmp_path)) is None
 
 
+def test_pick_next_and_has_running_ignore_hidden_temp_dirs(tmp_path):
+    """The doctor's writable-set probe leaves `.doctor-probe-*` scratch under running/; a stray temp
+    dir must never look like a real job (else the next tick false-finalizes it as crashed)."""
+    (tmp_path / "queue" / ".doctor-probe-abc").mkdir(parents=True)
+    (tmp_path / "running" / ".doctor-proot-xyz").mkdir(parents=True)
+    assert tick.pick_next(str(tmp_path)) is None       # hidden queue dir ignored
+    assert tick.has_running(str(tmp_path)) is False    # hidden running dir ignored
+    (tmp_path / "queue" / "20260602T1000Z-aaaa").mkdir()
+    assert tick.pick_next(str(tmp_path)) == "20260602T1000Z-aaaa"   # real job still picked
+
+
 def test_has_running(tmp_path):
     (tmp_path / "running" / "20260601T0900Z-bbbb").mkdir(parents=True)
     assert tick.has_running(str(tmp_path)) is True
@@ -112,6 +123,58 @@ def test_has_running(tmp_path):
 
 def test_no_running_when_dir_absent(tmp_path):
     assert tick.has_running(str(tmp_path)) is False
+
+
+def test_job_props_writable_set_is_jobdir_not_state_root(tmp_path):
+    """tick must put the JOB DIR (running/<jid>) in the confined unit's writable set, never the whole
+    state clone — the regression guard for the fence-escape hole. Also confirms the repo is writable
+    (the agent does its work there) while the state root and running/ parent are NOT."""
+    rdir = str(tmp_path / "running" / "jid1")
+    props = tick._job_props({"id": "x"}, proot="/work/repo", rdir=rdir,
+                            worker_home=str(tmp_path / "home"))
+    rw = [p[len("--property=ReadWritePaths="):] for p in props if p.startswith("--property=ReadWritePaths=")]
+    assert rdir in rw and "/work/repo" in rw
+    assert str(tmp_path) not in rw                       # state root absent
+    assert str(tmp_path / "running") not in rw           # only the job dir, not the running/ parent
+    assert "--property=ProtectHome=read-only" in props
+
+
+def test_worker_cmd_runs_engine_isolated():
+    cmd = tick._worker_cmd()
+    assert cmd[1:3] == ["-B", "-s"]                 # no __pycache__ to read-only /opt/baton; no ~/.local
+    assert cmd[-1].endswith("/runner/worker.py")    # from CODE (the deployed engine tree)
+
+
+def test_classify_sdk_completion_table():
+    # no sentinel + unit terminal -> hard crash; + non-terminal -> still running (fail-closed)
+    assert tick.classify_sdk(done_present=False, unit_terminal=True,  result=None, blocked_present=False)[0] == "crashed"
+    assert tick.classify_sdk(done_present=False, unit_terminal=False, result=None, blocked_present=False)[0] == "running"
+    # sentinel present but result.json missing/corrupt -> crashed, NOT a false 'done' (unsafe direction)
+    assert tick.classify_sdk(done_present=True, unit_terminal=True, result=None, blocked_present=False)[0] == "crashed"
+    # sentinel present + clean result -> done (summary from result)
+    s, summ = tick.classify_sdk(done_present=True, unit_terminal=True,
+                                result={"is_error": False, "result": "all good"}, blocked_present=False)
+    assert s == "done" and summ == "all good"
+    # sentinel + is_error -> blocked; sentinel + BLOCKED.txt -> blocked even if not is_error
+    assert tick.classify_sdk(done_present=True, unit_terminal=True,
+                             result={"is_error": True, "result": "x"}, blocked_present=False)[0] == "blocked"
+    assert tick.classify_sdk(done_present=True, unit_terminal=True,
+                             result={"is_error": False, "result": "x"}, blocked_present=True)[0] == "blocked"
+
+
+def test_write_report_blocked_surfaces_blocked_txt_reason(tmp_path):
+    (tmp_path / "BLOCKED.txt").write_text("needs the staging DB password\n")
+    tick._write_report(str(tmp_path), "jid1", "blocked", {"total_cost_usd": 0.01, "result": "I stopped."})
+    report = (tmp_path / "report.md").read_text()
+    assert "Blocked reason:" in report and "staging DB password" in report   # the canonical reason
+    assert "I stopped." in report                                            # plus the agent's summary
+
+
+def test_write_report_crashed_includes_err_tail(tmp_path):
+    (tmp_path / "err.txt").write_text("killed by signal 15 (RuntimeMaxSec/stop)\n")
+    tick._write_report(str(tmp_path), "jid2", "blocked", None)               # res None -> crashed report
+    report = (tmp_path / "report.md").read_text()
+    assert "crashed jid2" in report and "killed by signal 15" in report
 
 
 def test_launch_cmd():

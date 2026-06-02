@@ -58,7 +58,7 @@ if id "$WU" >/dev/null 2>&1; then
 fi
 
 # 2. Remove the root-owned fence.
-sudo rm -rf /opt/baton /etc/claude-code/managed-settings.json && ok "fence removed (/opt/baton + managed-settings)"
+sudo rm -rf /opt/baton /opt/baton-sdk /etc/claude-code/managed-settings.json && ok "fence + engine removed (/opt/baton, /opt/baton-sdk, managed-settings)"
 sudo rmdir /etc/claude-code 2>/dev/null || true   # only if now empty
 
 # 3. Remove the worker account + its home (clones, creds, env).

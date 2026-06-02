@@ -13,6 +13,14 @@ def test_build_has_seam_fields():
                        effort="medium", mode="fresh", repos=[], created_at="2026-06-01T14:32:00Z")
     assert m["capabilities"] == []
     assert m["model"] == "sonnet" and m["effort"] == "medium" and m["mode"] == "fresh"
+    assert m["engine"] == "sdk"          # default engine is now the SDK worker (validated + soaked live)
+    assert m["max_turns"] is None
+
+
+def test_build_engine_cli_fallback_opt_in():
+    m = manifest.build(id="x", project="example", model="sonnet", effort="low", mode="fresh",
+                       repos=[], created_at="2026-06-01T00:00:00Z", engine="cli", max_turns=40)
+    assert m["engine"] == "cli" and m["max_turns"] == 40   # CLI stays selectable as the fallback
 
 
 def test_roundtrip(tmp_path):

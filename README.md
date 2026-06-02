@@ -27,7 +27,7 @@ Long-running coding tasks pin you to your laptop — you can't close the lid wit
 ## How it works
 
 1. On your laptop, the `handoff` skill packages a brief + (for mid-task work) commits and pushes your changes to a `wip/handoff-<id>` branch, and writes a job to a git-backed queue.
-2. The worker drains the queue (a systemd timer), reproduces the state, and launches `claude -p` headless with your chosen **model + effort**.
+2. The worker drains the queue (a systemd timer), reproduces the state, and runs the agent headless with your chosen **model + effort** (engine: the in-process Claude Agent SDK by default, or the `claude -p` CLI as a fallback).
 3. It works to completion inside the OS sandbox, opens a **draft PR**, and writes a report.
 4. **GitHub emails you about the PR** (done — or a `[BLOCKED]` draft PR if it's stuck); you review it. No notifier to set up — notifications are GitHub-native (enable "email about your own activity" once, since the worker opens PRs as your account). *Optional:* for a direct email instead, set just your address + an app password in `~/.baton.env` (`SMTP_HOST`/`SMTP_USER`/`SMTP_PASS`; From and To default to your address) and baton emails you on done/blocked.
 
@@ -36,7 +36,8 @@ Long-running coding tasks pin you to your laptop — you can't close the lid wit
 - **Producer** (your laptop) and **Worker** (the always-on box) are roles; a machine can be either or both. They share only a **git remote**.
 - **Two identities on the worker:** jobs run as a dedicated, unprivileged **`baton`** user — never your account. *You* keep full manual control when you SSH in; the fence applies only to `baton`.
 - **The fence confines *effects*, not commands.** The agent may run any command and reach any host; it's the *blast radius* that's bounded, by layers: each job runs in an **OS sandbox** (a confined `systemd` service — file writes restricted to the project + job dir, the rest of the machine read-only, no privilege escalation) · the unprivileged **`baton`** user · a **scoped, non-admin git credential** (no admin, can't merge PRs or change settings) · **no cloud credentials** on the box · the **wip-branch + draft-PR workflow** (the agent opens PRs; it doesn't push to `main`). A slim `PreToolUse` guard adds a read-only allowlist for external (MCP) tools — the one thing the OS sandbox can't reach. *(We tried statically classifying every command instead; an autonomous agent can always phrase around a text classifier, so we confine at the OS layer.)*
-- **Grows by extending, not rewriting:** per-job options live in the manifest (`model`, `effort`, an empty `capabilities` seam); projects are config files; the git host is an adapter.
+- **Grows by extending, not rewriting:** per-job options live in the manifest (`model`, `effort`, `engine` — the `claude -p` CLI or the in-process Agent SDK — and an empty `capabilities` seam); projects are config files; the git host is an adapter.
+- **Two worker engines, one fence.** A job runs either the in-process **Claude Agent SDK** worker (the default — it writes a structured result + a `done.json` completion sentinel and turns a timeout-kill into a typed diagnostic) or the `claude -p` CLI (`manifest.engine = cli`, the fallback). Both run inside the *same* OS sandbox under the *same* root-owned `PreToolUse` guard hook — the engine is an implementation detail, not a trust boundary.
 
 ## Requirements
 
@@ -92,9 +93,9 @@ If a job is genuinely blocked, it stops, writes a reason, and notifies you.
 ```
 bin/baton            CLI: doctor · install · token
 setup.sh             one command: worker (admin) and/or producer   teardown.sh   one-command reverse (--soft to pause)
-lib/                 manifest · doctor (+ fence/sandbox checks) · nodes (registry)
+lib/                 manifest (per-job contract) · doctor (fence + writable-set / engine-immutability checks) · sandbox (job confinement props) · nodes (registry)
 guard/guard.py       slim PreToolUse hook: MCP read-only allowlist + soft denied-command guardrail
-runner/              tick (drain · auto-clone · launch jobs in an OS sandbox · poll) · notify (GitHub-native + optional SMTP)
+runner/              tick (drain · auto-clone · launch · poll · CLI/SDK engine branch) · worker (in-process Agent SDK job) · notify (GitHub-native + optional SMTP)
 engine/skill/        laptop-side skills: handoff/ (run work) · add-project/ (register a repo)
 profile/             worker-charter (system prompt) · managed-settings (fence wiring) · denied.json (global soft denied list)
 projects/            per-project config (owner, paths, protected branches, host) — written by "add this project"

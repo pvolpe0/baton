@@ -132,13 +132,35 @@ if [ "$ROLE" = worker ] || [ "$ROLE" = both ]; then
   sudo chown "$WU:$WU" "$WHOME/.baton.env"; sudo chmod 600 "$WHOME/.baton.env"
   ok "env written (${PAT:+GH_TOKEN }${CTOK:+CLAUDE_CODE_OAUTH_TOKEN }${MAIL:+SMTP }set)"
 
-  # 5. root-owned fence (the worker cannot edit it)
-  sudo install -D -m0755 "$ENGINE/guard/guard.py"  /opt/baton/guard/guard.py
-  sudo install -D -m0644 "$ENGINE/profile/denied.json" /opt/baton/denied.json   # global soft denied list (project-independent)
-  sudo rm -rf /opt/baton/projects 2>/dev/null || true                          # legacy per-project policy: no longer read by the guard
+  # 5. root-owned engine + fence (the worker cannot edit ANY code it runs UNCONFINED). The executable
+  #    engine is deployed to /opt/baton and tick/doctor run FROM there — never from the worker-writable
+  #    clone, so a job that overwrote ~/baton/runner/tick.py can't make the next tick run poisoned code
+  #    unconfined while building the fence. (Job state stays in the clone; the job's writable set is
+  #    narrowed to running/<jid>, so it can't reach the engine there either.)
+  sudo mkdir -p /opt/baton          # parent must exist — `cp -r src /opt/baton/runner` can't create it
+  sudo rm -rf /opt/baton/runner /opt/baton/lib /opt/baton/bin /opt/baton/profile /opt/baton/guard /opt/baton/projects
+  for d in runner lib bin profile guard; do sudo cp -r "$ENGINE/$d" "/opt/baton/$d"; done
+  sudo find /opt/baton -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  sudo install -D -m0644 "$ENGINE/profile/denied.json" /opt/baton/denied.json   # guard reads ../denied.json
   sudo install -D -m0644 "$ENGINE/profile/managed-settings.json" /etc/claude-code/managed-settings.json
   printf '%s' "$WU" | sudo tee /opt/baton/worker-user >/dev/null
-  ok "fence deployed (/opt/baton + /etc/claude-code, worker-user=$WU)"
+  sudo chown -R root:root /opt/baton                                            # worker can't own/edit it
+  sudo find /opt/baton -type d -exec chmod 0755 {} +                            # worker may traverse/read
+  sudo find /opt/baton -type f -exec chmod 0644 {} +                            # worker may read, NOT write
+  ok "engine + fence deployed root-owned to /opt/baton (worker-user=$WU; worker cannot edit it)"
+
+  # 5b. claude-agent-sdk for the SDK worker engine — the DEFAULT (manifest.engine='sdk'; 'cli' is the
+  #     per-job fallback). Installed in a ROOT-OWNED venv so worker.py runs it with `python3 -s` — the
+  #     job-writable ~/.local is off its import path, so a job can't poison the worker's imports.
+  #     Non-fatal here, but doctor FAILS without it (default jobs would block), so the operator is told.
+  [ -x /opt/baton-sdk/bin/python ] || sudo python3 -m venv /opt/baton-sdk
+  if sudo /opt/baton-sdk/bin/pip install -q --upgrade pip >/dev/null 2>&1 \
+     && sudo /opt/baton-sdk/bin/pip install -q claude-agent-sdk >/dev/null 2>&1; then
+    sudo chown -R root:root /opt/baton-sdk
+    ok "claude-agent-sdk ready (/opt/baton-sdk; SDK worker engine available)"
+  else
+    warn "claude-agent-sdk install failed — SDK engine unavailable; the CLI engine still works"
+  fi
 
   # 6. drain timer (worker user-systemd)
   asb mkdir -p "$WHOME/.config/systemd/user"
@@ -154,7 +176,7 @@ if [ "$ROLE" = worker ] || [ "$ROLE" = both ]; then
 
   # 8. validate (registers the node; inert until green)
   say "validate"
-  asb env BATON_HOME="$ENGINE" python3 "$ENGINE/bin/baton" install worker && say "baton worker is READY" \
+  asb env BATON_STATE="$ENGINE" python3 -B /opt/baton/bin/baton install worker && say "baton worker is READY" \
     || { bad "doctor not green — see above"; exit 1; }
 fi
 

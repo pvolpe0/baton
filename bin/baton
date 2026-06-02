@@ -7,9 +7,13 @@ A node coordinates only through the shared git instance repo ($BATON_HOME). Join
 mesh = get git access to it + pass doctor. This is the seam multi-worker grows into."""
 import datetime, json, os, socket, subprocess, sys
 
-HOME = os.environ.get("BATON_HOME", os.path.expanduser("~/baton"))
+# CODE = where the engine RUNS FROM (root-owned /opt/baton on a deployed worker), derived from this
+# file's location so doctor imports lib from the immutable tree, never a job-writable clone. STATE =
+# the worker-writable git clone (projects/nodes/queue/running/done/blocked/.git).
+CODE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATE = os.environ.get("BATON_STATE") or os.environ.get("BATON_HOME") or os.path.expanduser("~/baton")
 CLAUDE = os.environ.get("BATON_CLAUDE", os.path.expanduser("~/.local/bin/claude"))
-sys.path.insert(0, HOME)
+sys.path.insert(0, CODE)
 from lib import doctor as D, nodes as N  # noqa: E402
 
 
@@ -21,7 +25,7 @@ def sh(args):
 
 
 def _project(name="example"):
-    return json.load(open(os.path.join(HOME, "projects", f"{name}.json")))
+    return json.load(open(os.path.join(STATE, "projects", f"{name}.json")))
 
 
 def _sandbox_works():
@@ -52,6 +56,67 @@ def _sandbox_works():
     return (False, f"could not verify confinement (systemd-run: {out.strip()[:100]})")
 
 
+def _writable_set_works():
+    """Live PROBE of the job sandbox's WRITABLE SET (not just ProtectHome): launch a throwaway
+    confined unit with the SAME props a real job gets (lib.sandbox.job_properties) and assert it CAN
+    write its job dir but CANNOT write the engine clone / state tree / /opt/baton / the home root /
+    /etc. Catches BOTH a too-broad set (a job could edit the unconfined-running code = the latent
+    escape) and a too-narrow set (the worker false-crashes writing result.json). systemd/Linux only —
+    verified on the Pi, not in unit tests, like _sandbox_works."""
+    import pwd as _pwd, shutil, tempfile
+    from lib import sandbox
+    home = _pwd.getpwuid(os.getuid()).pw_dir
+    state = os.environ.get("BATON_STATE") or os.environ.get("BATON_HOME") or os.path.join(home, "baton")
+    running = os.path.join(state, "running")
+    try:
+        os.makedirs(running, exist_ok=True)
+        jobdir = tempfile.mkdtemp(prefix=".doctor-probe-", dir=running)
+        proot = tempfile.mkdtemp(prefix=".doctor-proot-", dir=running)
+    except OSError as e:
+        return (False, f"could not create a probe job dir under {running}: {e}")
+    probe = (f"touch {jobdir}/w && echo JOBDIR_OK; "
+             f"touch {state}/.probe 2>/dev/null && echo STATE_OPEN; "
+             f"touch /opt/baton/.probe 2>/dev/null && echo OPT_OPEN; "
+             f"touch {home}/.probe 2>/dev/null && echo HOME_OPEN; "
+             f"touch {home}/.config/systemd/user/.probe 2>/dev/null && echo CONFIG_SYSTEMD_OPEN; "
+             f"touch /etc/.probe 2>/dev/null && echo ETC_OPEN")
+    sandbox.ensure_cache_dirs(home)      # match the real launcher: ReadWritePaths entries must exist,
+    props = sandbox.job_properties(proot=proot, jobdir=jobdir, home=home, max_runtime=30, tasks_max=64)  # else systemd-run fails on a fresh worker
+    env = {**os.environ, "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")}
+    out = ""
+    try:
+        r = subprocess.run(["systemd-run", "--user", "--wait", "--pipe", "--collect", "-q",
+                            *props, "bash", "-c", probe],
+                           capture_output=True, text=True, env=env, timeout=60)
+        out = (r.stdout or "") + (r.stderr or "")
+    except Exception as e:
+        out = f"probe failed to run: {e}"
+    finally:
+        for pth in (f"{state}/.probe", f"{home}/.probe", f"{home}/.config/systemd/user/.probe",
+                    "/opt/baton/.probe", "/etc/.probe"):
+            try:
+                os.remove(pth)
+            except OSError:
+                pass
+        shutil.rmtree(jobdir, ignore_errors=True)
+        shutil.rmtree(proot, ignore_errors=True)
+    return D.parse_writable_probe(out)
+
+
+def _sdk_engine_ready():
+    """The SDK worker is the DEFAULT engine, and it imports claude_agent_sdk from a root-owned venv at
+    /opt/baton-sdk. A missing/broken venv would block every default job, so the readiness gate must
+    catch it here (else doctor is false-green while the worker can't run its default engine). The CLI
+    engine still works as a per-job fallback (engine: 'cli')."""
+    py = "/opt/baton-sdk/bin/python"
+    if not os.path.exists(py):
+        return (False, f"{py} missing — run setup.sh (installs claude-agent-sdk), or set engine 'cli' per job")
+    r = sh([py, "-c", "import claude_agent_sdk as c; print(c.__version__)"])
+    if r.returncode == 0:
+        return (True, f"claude-agent-sdk {r.stdout.strip()} ({py})")
+    return (False, f"{py} present but claude_agent_sdk won't import: {(r.stderr or '').strip()[:120]}")
+
+
 def _checks_worker(p):
     c = []
     r = sh([CLAUDE, "--version"]); c.append(("claude-present", r.returncode == 0, (r.stdout or "missing").strip()))
@@ -78,6 +143,9 @@ def _checks_worker(p):
     c.append(("git-identity", bool(name and email),
               f"{name} <{email}>" if (name and email) else "UNSET — `git commit` will fail, job state can't push; set user.name/user.email"))
     c.append(("sandbox", *_sandbox_works()))               # confinement actually works on this host
+    c.append(("writable-set", *_writable_set_works()))     # the job's writable set is exactly right
+    c.extend(D.verify_engine_immutable())                  # engine code root-owned + worker-read-only
+    c.append(("sdk-engine", *_sdk_engine_ready()))         # the DEFAULT engine's venv imports the SDK
     home = pwd.getpwuid(os.getuid()).pw_dir                 # claude auth: a setup-token or a prior login
     envf = os.path.join(home, ".baton.env")
     tok = os.path.exists(envf) and any(l.startswith("CLAUDE_CODE_OAUTH_TOKEN=") and len(l.strip()) > 24 for l in open(envf))
@@ -108,7 +176,7 @@ def cmd_doctor(args):
 def cmd_install(args):
     role = (args[0] if args else "worker")
     host = socket.gethostname()
-    print(f"[baton install] role={role} host={host} BATON_HOME={HOME}")
+    print(f"[baton install] role={role} host={host} CODE={CODE} STATE={STATE}")
     if cmd_token([]) != 0:
         try:
             resp = input("Token has DANGEROUS privileges for baton. Type 'yes' to proceed anyway: ").strip().lower()
@@ -118,7 +186,7 @@ def cmd_install(args):
             print("[baton install] aborted — mint a minimal fine-grained PAT (Contents + Pull requests only) and re-run.")
             return 1
     ok = cmd_doctor([role]) == 0
-    N.register(HOME, hostname=host, role=role, doctor_ok=ok,
+    N.register(STATE, hostname=host, role=role, doctor_ok=ok,
                created_at=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))
     print(f"[baton install] node registered (doctor_ok={ok}). "
           + ("READY to run jobs." if ok else "INERT — fix the FAILs above and re-run `baton install`."))

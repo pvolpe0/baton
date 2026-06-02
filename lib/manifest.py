@@ -9,7 +9,7 @@ def new_id(now):
     return f"{now}-{secrets.token_hex(2)}"
 
 
-def build(*, id, project, model, effort, mode, repos, created_at):
+def build(*, id, project, model, effort, mode, repos, created_at, engine="sdk", max_turns=None):
     return {
         "id": id,
         "project": project,
@@ -17,6 +17,8 @@ def build(*, id, project, model, effort, mode, repos, created_at):
         "effort": effort,          # low | medium | high | xhigh | max
         "mode": mode,              # "fresh" | "continue"
         "repos": repos,            # [{repo, wip_branch, base_sha}]
+        "engine": engine,          # "sdk" (in-process Agent SDK worker.py, default) | "cli" (claude -p, fallback)
+        "max_turns": max_turns,    # optional SDK turn cap (None = unlimited)
         "capabilities": [],        # growth seam — empty in v1
         "created_at": created_at,
     }

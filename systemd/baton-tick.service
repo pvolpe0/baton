@@ -4,5 +4,9 @@ Description=baton drain tick (pick up + run handed-off jobs)
 [Service]
 Type=oneshot
 EnvironmentFile=%h/.baton.env
-Environment=BATON_HOME=%h/baton
-ExecStart=/usr/bin/python3 %h/baton/runner/tick.py
+# Run the engine from the root-owned, worker-read-only deploy at /opt/baton — NEVER from the
+# worker-writable clone (a job that overwrote ~/baton/runner/tick.py would otherwise run unconfined
+# next tick). -B avoids __pycache__ writes to read-only /opt/baton. BATON_STATE is the writable clone
+# that holds queue/running/done/blocked/.git/nodes/projects.
+Environment=BATON_STATE=%h/baton
+ExecStart=/usr/bin/python3 -B /opt/baton/runner/tick.py
