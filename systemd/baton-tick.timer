@@ -1,0 +1,9 @@
+[Unit]
+Description=run baton tick every 90s
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=90
+
+[Install]
+WantedBy=timers.target

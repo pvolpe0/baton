@@ -1,0 +1,11 @@
+{
+  "_comment": "Sample project config. The 'add this project' skill writes one of these for you from inside a repo; this is the manual reference. 'owner' is the GitHub org/user — the worker uses it to auto-clone on the first handoff. 'roots' are the paths that hold the repo(s) on each machine: for a SINGLE repo, point roots at the repo itself (the worker clones owner/<basename> there). For a POLYREPO, point roots at the parent dir and add a 'repos' list of member names (each cloned under the parent, minus never_mirror). The soft denied-command guardrail is now GLOBAL (/opt/baton/denied.json), not per-project.",
+  "name": "example",
+  "host": "github",
+  "owner": "your-github-org",
+  "roots": { "mac": "/Users/you/Workspace/your-project", "pi": "/home/baton/work/your-project" },
+  "default_branch": "main",
+  "protected_branches": ["main"],
+  "never_mirror": [],
+  "default_model": "sonnet"
+}

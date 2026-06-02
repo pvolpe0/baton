@@ -1,0 +1,4 @@
+{
+  "_comment": "baton soft denied-command guardrail (NOT a security boundary — the OS sandbox + no-cloud-creds are). ONE global list, deployed root-owned to /opt/baton/denied.json by setup.sh so the worker can't edit the guardrail it is fenced by. Matched against the basename of each command segment's first token (so a denied name in a message/filename doesn't trip it). Edit + re-deploy to tune; a missing file just means no soft guardrail — jobs stay fully OS-sandboxed either way.",
+  "denied_commands": ["deploy.sh"]
+}

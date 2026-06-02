@@ -1,0 +1,8 @@
+[Unit]
+Description=baton drain tick (pick up + run handed-off jobs)
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.baton.env
+Environment=BATON_HOME=%h/baton
+ExecStart=/usr/bin/python3 %h/baton/runner/tick.py

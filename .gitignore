@@ -1,0 +1,9 @@
+*.env
+.baton.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.tick.lock
+tick.log
+.fence-down
+.git-credentials

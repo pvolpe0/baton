@@ -1,0 +1,9 @@
+{
+  "_comment": "Deployed root-owned to /etc/claude-code/managed-settings.json. Wires the baton fence as a PreToolUse hook for Bash and every MCP tool (mcp__.* — a bare prefix matches nothing and fails open). guard.py self-gates by OS uid, so this is a no-op for the human user and only fences the dedicated worker. The mcp__.* matcher is required so destructive MCP tools are inspected too.",
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "python3 /opt/baton/guard/guard.py" }] },
+      { "matcher": "mcp__.*", "hooks": [{ "type": "command", "command": "python3 /opt/baton/guard/guard.py" }] }
+    ]
+  }
+}

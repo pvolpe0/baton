@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""baton CLI — v1 subcommands:
+  baton doctor [role]       run the safety checks for this node (role: worker|producer)
+  baton install [role]      run doctor, then register this node (inert until doctor passes)
+
+A node coordinates only through the shared git instance repo ($BATON_HOME). Joining the
+mesh = get git access to it + pass doctor. This is the seam multi-worker grows into."""
+import datetime, json, os, socket, subprocess, sys
+
+HOME = os.environ.get("BATON_HOME", os.path.expanduser("~/baton"))
+CLAUDE = os.environ.get("BATON_CLAUDE", os.path.expanduser("~/.local/bin/claude"))
+sys.path.insert(0, HOME)
+from lib import doctor as D, nodes as N  # noqa: E402
+
+
+def sh(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return subprocess.CompletedProcess(args, 1, "", str(e))
+
+
+def _project(name="example"):
+    return json.load(open(os.path.join(HOME, "projects", f"{name}.json")))
+
+
+def _sandbox_works():
+    """Live smoke-test of the OS confinement (the fence): run a throwaway confined transient service
+    that tries to write to the home root — which the worker user can normally write, but the job
+    sandbox (ProtectHome=read-only) must block. If the write is blocked, confinement is effective on
+    this kernel. Catches hosts where unprivileged namespaces / systemd sandboxing don't apply."""
+    import pwd as _pwd
+    home = _pwd.getpwuid(os.getuid()).pw_dir
+    probe = f"touch {home}/.baton-sandbox-probe 2>/dev/null && echo OPEN || echo CONFINED"
+    env = {**os.environ, "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")}
+    try:
+        r = subprocess.run(["systemd-run", "--user", "--wait", "--pipe", "--collect", "-q",
+                            "-p", "ProtectSystem=strict", "-p", "ProtectHome=read-only",
+                            "-p", "NoNewPrivileges=yes", "bash", "-c", probe],
+                           capture_output=True, text=True, env=env, timeout=30)
+    except Exception as e:
+        return (False, f"could not run the confinement probe: {e}")
+    out = (r.stdout or "") + (r.stderr or "")
+    try:
+        os.remove(os.path.join(home, ".baton-sandbox-probe"))   # in case the write slipped through
+    except OSError:
+        pass
+    if "CONFINED" in out:
+        return (True, "OS confinement active — job writes are blocked outside the project")
+    if "OPEN" in out:
+        return (False, "NOT confined — a job could write anywhere in the home dir (check systemd / unprivileged user namespaces)")
+    return (False, f"could not verify confinement (systemd-run: {out.strip()[:100]})")
+
+
+def _checks_worker(p):
+    c = []
+    r = sh([CLAUDE, "--version"]); c.append(("claude-present", r.returncode == 0, (r.stdout or "missing").strip()))
+    who = sh(["aws", "sts", "get-caller-identity"])
+    if who.returncode != 0:
+        c.append(("no-admin-creds", True, "no usable AWS identity (good for a worker)"))
+    else:
+        try:
+            user = json.loads(who.stdout)["Arn"].split("/")[-1]
+        except Exception:
+            user = ""
+        admin = D.parse_admin_access(sh(["aws", "iam", "list-attached-user-policies", "--user-name", user]).stdout)
+        c.append(("no-admin-creds", not admin, "AdministratorAccess present!" if admin else f"scoped: {user}"))
+    root = p["roots"]["pi"] if os.path.isdir(p["roots"]["pi"]) else p["roots"]["mac"]
+    for repo in p.get("never_mirror", []):
+        here = os.path.isdir(os.path.join(root, repo))
+        c.append((f"never_mirror:{repo}", not here, "PRESENT — remove it" if here else "absent"))
+    import pwd
+    c.extend(D.verify_fence(pwd.getpwuid(os.getuid()).pw_name))   # managed-settings + guard + worker-user, all immutable
+    ling = sh(["loginctl", "show-user", os.environ.get("USER", "")]).stdout
+    c.append(("linger", D.parse_linger(ling), "enabled" if D.parse_linger(ling) else "disabled — run loginctl enable-linger"))
+    name = sh(["git", "config", "user.name"]).stdout.strip()
+    email = sh(["git", "config", "user.email"]).stdout.strip()
+    c.append(("git-identity", bool(name and email),
+              f"{name} <{email}>" if (name and email) else "UNSET — `git commit` will fail, job state can't push; set user.name/user.email"))
+    c.append(("sandbox", *_sandbox_works()))               # confinement actually works on this host
+    home = pwd.getpwuid(os.getuid()).pw_dir                 # claude auth: a setup-token or a prior login
+    envf = os.path.join(home, ".baton.env")
+    tok = os.path.exists(envf) and any(l.startswith("CLAUDE_CODE_OAUTH_TOKEN=") and len(l.strip()) > 24 for l in open(envf))
+    creds = os.path.exists(os.path.join(home, ".claude", ".credentials.json"))
+    c.append(("claude-auth", tok or creds,
+              "token/login present" if (tok or creds) else "none — run `claude setup-token`, put CLAUDE_CODE_OAUTH_TOKEN in ~/.baton.env"))
+    return c
+
+
+def _checks_producer():
+    c = []
+    r = sh([CLAUDE, "--version"]); c.append(("claude-present", r.returncode == 0, (r.stdout or "missing").strip()))
+    skill = os.path.expanduser("~/.claude/skills/handoff/SKILL.md")
+    c.append(("handoff-skill", os.path.exists(skill), skill if os.path.exists(skill) else "not installed"))
+    return c
+
+
+def cmd_doctor(args):
+    role = (args[0] if args else "worker")
+    checks = _checks_worker(_project()) if role == "worker" else _checks_producer()
+    ok, lines = D.summarize(checks)
+    print(f"baton doctor ({role}) on {socket.gethostname()}:")
+    print("\n".join("  " + l for l in lines))
+    print(f"  => {'READY' if ok else 'NOT READY'}")
+    return 0 if ok else 1
+
+
+def cmd_install(args):
+    role = (args[0] if args else "worker")
+    host = socket.gethostname()
+    print(f"[baton install] role={role} host={host} BATON_HOME={HOME}")
+    if cmd_token([]) != 0:
+        try:
+            resp = input("Token has DANGEROUS privileges for baton. Type 'yes' to proceed anyway: ").strip().lower()
+        except EOFError:
+            resp = ""
+        if resp != "yes":
+            print("[baton install] aborted — mint a minimal fine-grained PAT (Contents + Pull requests only) and re-run.")
+            return 1
+    ok = cmd_doctor([role]) == 0
+    N.register(HOME, hostname=host, role=role, doctor_ok=ok,
+               created_at=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    print(f"[baton install] node registered (doctor_ok={ok}). "
+          + ("READY to run jobs." if ok else "INERT — fix the FAILs above and re-run `baton install`."))
+    return 0 if ok else 1
+
+
+def cmd_token(args):
+    """Inspect the GitHub token baton will use (GH_TOKEN/GITHUB_TOKEN) and warn on
+    privileges dangerous for a worker. Returns non-zero if dangerous (install gates on it)."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("baton token check: set GH_TOKEN to baton's PAT to check it (skipped).")
+        return 0
+    r = sh(["curl", "-sI", "-H", f"Authorization: token {token}", "https://api.github.com/user"])
+    header = ""
+    for line in r.stdout.splitlines():
+        if line.lower().startswith("x-oauth-scopes:"):
+            header = line.split(":", 1)[1].strip()
+            break
+    if not header:
+        print("baton token check: fine-grained PAT (no classic scopes) — good. Ensure it grants ONLY")
+        print("  Contents:read/write + Pull requests:write + Metadata:read, your repos only, NO Administration.")
+        return 0
+    scopes = D.parse_classic_scopes(header)
+    bad = D.dangerous_classic(scopes)
+    print(f"baton token check: CLASSIC PAT, scopes={scopes}")
+    if bad:
+        print(f"  WARNING - dangerous for baton: {bad}")
+        print("  baton needs only contents + pull_requests. These could let a job disable its own")
+        print("  branch-protection fence, modify CI/deploys, or read secrets. Use a fine-grained PAT.")
+        return 1
+    print("  scopes acceptable; a fine-grained PAT (Contents+PR only) is still safer than classic.")
+    return 0
+
+
+def main():
+    cmds = {"doctor": cmd_doctor, "install": cmd_install, "token": cmd_token}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        print("usage: baton {doctor|install|token} [worker|producer]")
+        return 2
+    return cmds[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
