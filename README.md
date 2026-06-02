@@ -1,5 +1,7 @@
 # 🪄 baton
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE) [![Built with Claude Code](https://img.shields.io/badge/built%20with-Claude%20Code-d97757.svg)](https://claude.com/claude-code) ![Platform: Linux + systemd](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-informational.svg) ![Python 3](https://img.shields.io/badge/python-3-blue.svg)
+
 **An always-on agent that takes handoffs of your in-progress work and finishes them on your own hardware.**
 
 You're coding on your laptop. You say *"hand this off."* Your work — including your *uncommitted, mid-task* changes — travels to an always-on box you own (a Raspberry Pi, a home server). A Claude Code agent there finishes the task autonomously, opens a draft PR, and pings you. You can close your laptop.
